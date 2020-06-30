@@ -1062,6 +1062,8 @@ private:
   bool connect_with_proxy(Socket &sock, Response &res, bool &success);
   bool initialize_ssl(Socket &socket);
 
+  bool load_cert();
+
   bool verify_host(X509 *server_cert) const;
   bool verify_host_with_subject_alt_name(X509 *server_cert) const;
   bool verify_host_with_common_name(X509 *server_cert) const;
@@ -1069,12 +1071,14 @@ private:
 
   SSL_CTX *ctx_;
   std::mutex ctx_mutex_;
+  std::once_flag initialize_cert_;
+
   std::vector<std::string> host_components_;
 
   std::string ca_cert_file_path_;
   std::string ca_cert_dir_path_;
   X509_STORE *ca_cert_store_ = nullptr;
-  bool server_certificate_verification_ = false;
+  bool server_certificate_verification_ = true;
   long verify_result_ = 0;
 
   friend class Client;
@@ -1313,9 +1317,7 @@ public:
 
   void stop() { cli_->stop(); }
 
-  void set_tcp_nodelay(bool on) {
-    cli_->set_tcp_nodelay(on);
-  }
+  void set_tcp_nodelay(bool on) { cli_->set_tcp_nodelay(on); }
 
   void set_socket_options(SocketOptions socket_options) {
     cli_->set_socket_options(socket_options);
@@ -5543,23 +5545,44 @@ inline bool SSLClient::connect_with_proxy(Socket &socket, Response &res,
   return true;
 }
 
+inline bool SSLClient::load_cert() {
+  bool ret = true;
+
+  std::call_once(initialize_cert_, [&]() {
+    std::lock_guard<std::mutex> guard(ctx_mutex_);
+    if (!ca_cert_file_path_.empty()) {
+      if (!SSL_CTX_load_verify_locations(ctx_, ca_cert_file_path_.c_str(),
+                                         nullptr)) {
+        ret = false;
+      }
+    } else if (!ca_cert_dir_path_.empty()) {
+      if (!SSL_CTX_load_verify_locations(ctx_, nullptr,
+                                         ca_cert_dir_path_.c_str())) {
+        ret = false;
+      }
+    } else if (ca_cert_store_ != nullptr) {
+      if (SSL_CTX_get_cert_store(ctx_) != ca_cert_store_) {
+        SSL_CTX_set_cert_store(ctx_, ca_cert_store_);
+      }
+    } else {
+#ifndef _WIN32
+      SSL_CTX_set_default_verify_paths(ctx_);
+#else
+      // TODO:
+#endif
+    }
+  });
+
+  return ret;
+}
+
 inline bool SSLClient::initialize_ssl(Socket &socket) {
   auto ssl = detail::ssl_new(
       socket.sock, ctx_, ctx_mutex_,
       [&](SSL *ssl) {
-        if (ca_cert_file_path_.empty() && ca_cert_store_ == nullptr) {
-          SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
-        } else if (!ca_cert_file_path_.empty()) {
-          if (!SSL_CTX_load_verify_locations(ctx_, ca_cert_file_path_.c_str(),
-                                             nullptr)) {
-            return false;
-          }
-          SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, nullptr);
-        } else if (ca_cert_store_ != nullptr) {
-          if (SSL_CTX_get_cert_store(ctx_) != ca_cert_store_) {
-            SSL_CTX_set_cert_store(ctx_, ca_cert_store_);
-          }
-          SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, nullptr);
+        if (server_certificate_verification_) {
+          if (!load_cert()) { return false; }
+          SSL_set_verify(ssl, SSL_VERIFY_NONE, nullptr);
         }
 
         if (SSL_connect(ssl) != 1) { return false; }
